@@ -1,0 +1,25 @@
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.13.0' # Ensure this matches your project's Flutter version
+      - name: Install Firebase CLI
+        run: npm install -g firebase-tools
+      - name: Install Python deps & start emulators
+        run: |
+          cd backend/functions
+          # Assuming python3 and pip are available in the runner
+          python3 -m venv .venv 
+          source .venv/bin/activate
+          pip install -r requirements.txt
+          cd ../..
+          # Check if firebase emulators:exec needs interactive input or specific ports
+          firebase emulators:exec --only firestore,functions "echo 'Emulators running'"
+      - name: Run Flutter tests
+        run: |
+          cd frontend/app
+          flutter pub get
+          flutter test --coverage

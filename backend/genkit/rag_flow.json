@@ -1,0 +1,9 @@
+{
+  "name": "RAGFlow",
+  "steps": [
+    { "id": "retrieve", "type": "retrieval", "params": { "collection":"studyDocuments/chunks" } },
+    { "id": "condense",  "type": "aggregation" },
+    { "id": "route",     "type": "logic", "params": { /* branch simple vs scenario */ } },
+    { "id": "generate",  "type": "llm", "params": { "model": "gpt-4o-mini" } }
+  ]
+}

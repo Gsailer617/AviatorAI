@@ -1,0 +1,4 @@
+firebase-admin
+firebase-functions
+genkit
+openai

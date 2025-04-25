@@ -1,0 +1,14 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Users only read/write their own profiles
+    match /users/{userId} {
+      allow read, write: if request.auth.uid == userId;
+    }
+    // Chats under users/{userId}/chats/{chatId}
+    match /users/{userId}/chats/{chatId=**} {
+      allow read, write: if request.auth.uid == userId;
+    }
+    // Quizzes, feedback similarly scoped...
+  }
+}
