@@ -10,6 +10,7 @@
     pkgs.flutter  # Added Flutter
     pkgs.python3  # Added Python 3
     # pkgs.go
+    pkgs.openjdk17-bootstrap
   ];
   # Sets environment variables in the workspace
   env = {

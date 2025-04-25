@@ -1,9 +1,12 @@
+\
 import firebase_functions as fn
+from firebase_functions.https_fn import HttpsError, FunctionsErrorCode
 import firebase_admin
-from firebase_admin import firestore, auth as firebase_auth
+from firebase_admin import firestore
+from google.cloud.firestore_v1.base_query import FieldFilter, Query
 from datetime import datetime, timezone, timedelta
 import logging
-import random
+from collections import Counter # Needed for processFeedbackLoop
 
 # Assuming config.py is in the genkit directory, relative import works
 from backend.genkit.config import load_and_run_flow # Import the Genkit runner
@@ -33,467 +36,467 @@ def now_utc():
 @fn.https_fn.on_call(max_instances=10) # Adjust concurrency as needed
 def chatWithAI(request: fn.https_fn.CallableRequest):
     """Handles a conversational turn using RAG."""
-    logger.info(f"chatWithAI triggered with data: {request.data}")
+    logger.info(f"chatWithAI triggered.")
 
-    # 1. Auth & input validation
-    if request.auth is None:
-        logger.error("Authentication required.")
-        raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.UNAUTHENTICATED,
-                                     message="The function must be called while authenticated.")
+    # 1. Auth & input
+    if not request.auth:
+        logger.error("Authentication required for chatWithAI.")
+        # Use the specific ForbiddenError if defined, otherwise standard HttpsError
+        # Assuming ForbiddenError is like HttpsError(code=FunctionsErrorCode.PERMISSION_DENIED, message="...")
+        raise HttpsError(code=FunctionsErrorCode.UNAUTHENTICATED,
+                         message="Authentication required")
     uid = request.auth.uid
-    message_text = request.data.get("message")
-    chat_id = request.data.get("chatId") # Optional
+    body = request.data or {}
+    message_text = body.get("message")
+    chat_id = body.get("chatId")   # may be None
 
     if not message_text or not isinstance(message_text, str) or len(message_text.strip()) == 0:
         logger.error("Invalid message text provided.")
-        raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-                                     message='The function must be called with a valid "message" argument.')
-    
+        raise HttpsError(code=FunctionsErrorCode.INVALID_ARGUMENT,
+                         message='The function must be called with a valid "message" argument.')
     if chat_id and not isinstance(chat_id, str):
         logger.error("Invalid chatId provided.")
-        raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-                                     message='If provided, "chatId" must be a string.')
+        raise HttpsError(code=FunctionsErrorCode.INVALID_ARGUMENT,
+                         message='If provided, "chatId" must be a string.')
 
     try:
-        user_chat_collection = db.collection("users").document(uid).collection("chats")
-
-        # 2. Create or lookup chat
-        if not chat_id:
-            new_chat_ref = user_chat_collection.document()
-            chat_id = new_chat_ref.id
-            logger.info(f"Creating new chat with ID: {chat_id} for user: {uid}")
-            new_chat_ref.set({
-                "startTime": now_utc(),
-                "topicGuess": None # Or potentially try a quick guess here?
-            })
+        # 2. Create/lookup chat doc
+        chats_ref = db.collection("users").document(uid).collection("chats")
+        if chat_id:
+            chat_ref = chats_ref.document(chat_id)
+            logger.info(f"Using existing chat ID: {chat_id} for user: {uid}")
+            # Optionally check existence if needed, but set() or update() handle creation
         else:
-            # Validate chat_id exists (optional but good practice)
-            chat_ref = user_chat_collection.document(chat_id)
-            if not chat_ref.get().exists:
-                 logger.error(f"Chat with ID {chat_id} not found for user {uid}.")
-                 raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.NOT_FOUND,
-                                              message=f"Chat with ID {chat_id} not found.")
-            logger.info(f"Continuing chat with ID: {chat_id} for user: {uid}")
+            chat_ref = chats_ref.document() # Generate new ID
+            chat_ref.set({"startTime": firestore.SERVER_TIMESTAMP}) # Create doc with timestamp
+            chat_id = chat_ref.id # Get the new ID
+            logger.info(f"Created new chat with ID: {chat_id} for user: {uid}")
 
-        chat_messages_collection = user_chat_collection.document(chat_id).collection("messages")
+        messages_coll_ref = chat_ref.collection("messages")
 
-        # 3. Store user’s message
-        logger.info("Storing user message.")
-        user_message_ref = chat_messages_collection.document()
-        user_message_ref.set({
-            "sender": "user",
+        # 3. Persist user message
+        logger.info("Persisting user message.")
+        msg_ref = messages_coll_ref.document()
+        msg_ref.set({
+            "sender":"user",
             "text": message_text,
-            "timestamp": now_utc(),
-            "sources": [],
-            "feedbackRating": None
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "sources": [], # User messages have no sources from RAG
+            "feedbackRating": None # Initial feedback state
         })
+        logger.info(f"User message stored: {msg_ref.path}")
 
         # 4. Fetch context
-        logger.info("Fetching context for RAG flow.")
-        context_summary = "" # Default empty string
+        logger.info("Fetching context (summary and recent messages).")
+        context_text = ""
+        # Path for context summary doc - ADJUST IF YOUR STRUCTURE DIFFERS
+        ctx_doc_ref = db.collection("users").document(uid).collection("contextSummary").document("latest")
         try:
-            context_summary_ref = db.collection("users").document(uid).collection("state").document("contextSummary") # Adjusted path
-            context_summary_doc = context_summary_ref.get()
-            if context_summary_doc.exists:
-                context_summary = context_summary_doc.to_dict().get("summary", "")
-                logger.info("Found existing context summary.")
+            ctx_doc = ctx_doc_ref.get()
+            if ctx_doc.exists:
+                context_text = ctx_doc.to_dict().get("summary","") # Get summary or default to empty
+                logger.info("Found context summary.")
             else:
-                logger.info("No existing context summary found.")
+                logger.info("No context summary document found.")
         except Exception as e:
-            logger.warning(f"Could not fetch context summary for user {uid}: {e}")
+             logger.warning(f"Could not fetch context summary at {ctx_doc_ref.path}: {e}")
 
-        # Fetch recent messages (e.g., last 5 turns = 10 messages)
-        recent_messages_data = []
+        # Fetch last 5 messages (as per instruction)
+        recent_msgs_data = []
         try:
-            # Query last 10 messages (user + AI), ordered by timestamp
-            messages_query = chat_messages_collection.order_by("timestamp", direction=firestore.Query.DESCENDING).limit(10)
-            docs = messages_query.stream()
-            # We need them in chronological order for the RAG flow
-            recent_messages_data = sorted(
-                [{ "sender": doc.get("sender"), "text": doc.get("text") } for doc in docs if doc.exists],
-                key=lambda x: messages_query.stream().__next__().get("timestamp") # Approximation, Firestore doesn't guarantee order preservation after list conversion
-                # Correct way requires getting timestamps and sorting after fetching
-            )
-            # Proper sorting after fetch:
-            fetched_docs = [(doc.get("timestamp"), { "sender": doc.get("sender"), "text": doc.get("text") }) for doc in messages_query.stream() if doc.exists]
-            fetched_docs.sort(key=lambda x: x[0]) # Sort by timestamp (oldest first)
-            recent_messages_data = [item[1] for item in fetched_docs]
+            # Query last 5 messages, ordered descending by timestamp
+            # Note: The instruction used stream() then list(), which fetches all results.
+            # Using .limit(5).stream() is more direct.
+            recent_msgs_query = messages_coll_ref.order_by("timestamp", direction=firestore.Query.DESCENDING).limit(5)
+            docs = list(recent_msgs_query.stream()) # Fetch the limited docs
 
-            logger.info(f"Fetched {len(recent_messages_data)} recent messages.")
+            # Extract sender and text, store with timestamp for sorting
+            fetched_msgs = []
+            for doc in docs:
+                 if doc.exists:
+                      msg_data = doc.to_dict()
+                      fetched_msgs.append((
+                          msg_data.get("timestamp"), # Keep timestamp for sorting
+                          {"sender": msg_data.get("sender"), "text": msg_data.get("text")}
+                      ))
+
+            # Sort chronologically (oldest first) because LLMs usually expect history in order
+            fetched_msgs.sort(key=lambda x: x[0] if x[0] else datetime.min.replace(tzinfo=timezone.utc)) # Handle potential missing timestamps gracefully
+            recent_msgs_data = [item[1] for item in fetched_msgs] # Extract dicts after sorting
+
+            logger.info(f"Fetched {len(recent_msgs_data)} recent messages for context.")
         except Exception as e:
             logger.warning(f"Could not fetch recent messages for chat {chat_id}: {e}")
 
-        # 5. Call Genkit RAG flow
+        # 5. Genkit RAG call
         logger.info("Calling Genkit RAG flow.")
         rag_input = {
             "userId": uid,
             "message": message_text,
-            "contextSummary": context_summary,
-            "recentMessages": recent_messages_data,
-            # Add other relevant data if your flow expects it
+            "contextSummary": context_text,
+            # Ensure the key matches exactly what the flow expects (e.g., "recentMessages")
+            "recentMessages": recent_msgs_data
         }
-        
         try:
-            # Use the imported function
+            # Name "RAGFlow" should match the flow definition name/file
             rag_output = load_and_run_flow("RAGFlow", rag_input)
-            logger.info(f"RAG flow returned successfully. Output keys: {list(rag_output.keys())}")
-            
-            # Basic validation of expected output
-            if "text" not in rag_output or "sources" not in rag_output:
-                logger.error(f"RAG flow output is missing expected keys ('text', 'sources'). Output: {rag_output}")
-                raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INTERNAL, message="RAG flow returned invalid data.")
+            logger.info(f"RAG flow returned successfully.")
 
+            # Validate RAG output structure
+            if not isinstance(rag_output, dict) or "text" not in rag_output or "sources" not in rag_output:
+                logger.error(f"RAG flow output is missing expected keys ('text', 'sources') or is not a dict. Output: {rag_output}")
+                raise HttpsError(code=FunctionsErrorCode.INTERNAL, message="RAG flow returned invalid data.")
+            if not isinstance(rag_output["sources"], list):
+                 logger.error(f"RAG flow 'sources' output is not a list. Output: {rag_output}")
+                 raise HttpsError(code=FunctionsErrorCode.INTERNAL, message="RAG flow returned invalid sources format.")
+
+        except HttpsError:
+             raise # Re-throw validation errors
         except Exception as e:
-            logger.error(f"Error calling RAG flow: {e}")
-            # Decide: return generic error or specific based on e?
-            raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INTERNAL, 
-                                         message="Failed to get response from AI model.")
+            logger.error(f"Error calling or processing RAG flow: {e}")
+            raise HttpsError(code=FunctionsErrorCode.INTERNAL,
+                             message="Failed to get response from AI model.")
 
-        # 6. Persist AI response
-        logger.info("Storing AI response.")
-        ai_message_ref = chat_messages_collection.document()
-        ai_message_payload = {
+        # 6. Persist AI message
+        logger.info("Persisting AI response.")
+        ai_ref = messages_coll_ref.document()
+        ai_payload = {
             "sender": "ai",
             "text": rag_output["text"],
-            "sources": rag_output["sources"], # Ensure this is Firestore-compatible (e.g., list of dicts)
-            "timestamp": now_utc(),
+            "sources": rag_output["sources"], # Assume sources format is Firestore-compatible
+            "timestamp": firestore.SERVER_TIMESTAMP,
             "feedbackRating": None
         }
-        ai_message_ref.set(ai_message_payload)
-        logger.info(f"AI response stored with ID: {ai_message_ref.id}")
+        ai_ref.set(ai_payload)
+        logger.info(f"AI response stored: {ai_ref.path}")
 
-        # 7. Return payload
+        # 7. Return
         response_payload = {
             "chatId": chat_id,
-            "messageId": ai_message_ref.id,
+            "messageId": ai_ref.id, # ID of the AI message just created
             "responseText": rag_output["text"],
             "sources": rag_output["sources"]
         }
-        logger.info(f"Returning response payload: {response_payload}")
+        logger.info(f"Returning response payload for chat {chat_id}.")
         return response_payload
 
-    except fn.https_fn.HttpsError as e:
-        # Re-throw HttpsErrors directly
-        raise e
+    except HttpsError as e:
+        raise e # Re-throw known validation/auth errors
     except Exception as e:
-        logger.exception(f"An unexpected error occurred in chatWithAI for user {uid}: {e}") # Log full traceback
-        raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INTERNAL, 
-                                     message="An internal error occurred.")
+        logger.exception(f"An unexpected error occurred in chatWithAI for user {uid}: {e}")
+        raise HttpsError(code=FunctionsErrorCode.INTERNAL,
+                         message="An internal error occurred processing your message.")
 
 
-@fn.https_fn.on_call(max_instances=5)
+@fn.https_fn.on_call(max_instances=5) # Adjust concurrency as needed
 def generateQuiz(request: fn.https_fn.CallableRequest):
-    """Generates a quiz, potentially based on user progress."""
-    logger.info(f"generateQuiz triggered with data: {request.data}")
+    """Generates a quiz, potentially based on user's weak topics."""
+    logger.info("generateQuiz triggered.")
 
-    # 1. Auth & input validation
-    if request.auth is None:
+    # 1. Auth & params
+    if not request.auth:
         logger.error("Authentication required for generateQuiz.")
-        raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.UNAUTHENTICATED,
-                                     message="The function must be called while authenticated.")
+        raise HttpsError(code=FunctionsErrorCode.UNAUTHENTICATED,
+                         message="Authentication required")
     uid = request.auth.uid
-    num_questions = request.data.get("numQuestions", 5) # Default to 5 questions
-    topic_filters = request.data.get("topicFilters") # Optional list of topics
+    data = request.data or {}
+    num_questions = data.get("numQuestions", 5) # Default to 5 questions
 
-    # Validate inputs
-    if not isinstance(num_questions, int) or num_questions <= 0 or num_questions > 20: # Add reasonable limits
+    # Validate num_questions
+    if not isinstance(num_questions, int) or not (1 <= num_questions <= 20): # Sensible limits
          logger.error(f"Invalid numQuestions: {num_questions}")
-         raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-                                      message="'numQuestions' must be a positive integer (max 20)." )
-    if topic_filters and not isinstance(topic_filters, list):
-        logger.error(f"Invalid topicFilters: {topic_filters}")
-        raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-                                     message="'topicFilters' must be a list of strings." )
+         raise HttpsError(code=FunctionsErrorCode.INVALID_ARGUMENT,
+                          message="Parameter 'numQuestions' must be an integer between 1 and 20.")
 
     try:
-        # 2. Gather user state / determine topics
-        selected_topics = []
-        if topic_filters:
-            logger.info(f"Using provided topic filters: {topic_filters}")
-            selected_topics = topic_filters
-        else:
-            # Try fetching weak topics
-            try:
-                # TODO: Manually update this path if your weak topics are stored elsewhere
-                weak_topics_ref = db.collection("users").document(uid).collection("progress").document("weakTopics")
-                weak_topics_doc = weak_topics_ref.get()
-                if weak_topics_doc.exists:
-                    weak_topics_data = weak_topics_doc.to_dict().get("topics", []) # Assuming structure { topics: [...] }
-                    if weak_topics_data:
-                        # Sample from weak topics if available
-                        # Simple sampling: take up to 5 random weak topics
-                        sample_size = min(len(weak_topics_data), 5) # Limit sample size
-                        selected_topics = random.sample(weak_topics_data, sample_size)
-                        logger.info(f"Sampled weak topics: {selected_topics}")
-            except Exception as e:
-                logger.warning(f"Could not fetch or sample weak topics for user {uid}: {e}")
-        
-        # Fallback to default topics if none selected
-        if not selected_topics:
-             # TODO: Manually define your default FAA-style topics here
-            default_topics = ["Airspace", "Weather", "Regulations", "Aerodynamics", "Navigation"]
-            selected_topics = random.sample(default_topics, min(len(default_topics), 3)) # Sample a few defaults
-            logger.info(f"Falling back to default topics: {selected_topics}")
-
-
-        # 3. & 4. Compose prompt and call LLM (using Genkit flow)
-        logger.info(f"Generating {num_questions} questions on topics: {selected_topics}")
-        quiz_input = {
-            "userId": uid, # Optional, but potentially useful for personalization
-            "numQuestions": num_questions,
-            "topics": selected_topics
-        }
-        
+        # 2. Fetch weakTopics
+        topics = []
+        # Path for weak topics doc - ADJUST IF YOUR STRUCTURE DIFFERS
+        wt_doc_ref = db.collection("users").document(uid).collection("progress").document("weakTopics")
         try:
-            # TODO: Ensure you have a "QuizFlow" defined in backend/genkit/quiz_flow.json
-            # And that load_and_run_flow in config.py handles it.
-            quiz_output = load_and_run_flow("QuizFlow", quiz_input)
-            logger.info("QuizFlow executed successfully.")
-            
-            # Validate output structure (adjust based on your actual QuizFlow output)
-            if "questions" not in quiz_output or not isinstance(quiz_output["questions"], list):
-                 logger.error(f"QuizFlow output missing or invalid 'questions' list. Output: {quiz_output}")
-                 raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INTERNAL, message="Quiz generation failed.")
-            
-            # Further validation of question structure (optional but recommended)
-            for q in quiz_output["questions"]:
-                if not all(k in q for k in ["question", "choices", "correctAnswer", "explanation"]):
-                    logger.error(f"Invalid question structure in QuizFlow output: {q}")
-                    raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INTERNAL, message="Quiz data format incorrect.")
-
-        except fn.https_fn.HttpsError: # Re-raise validation errors
-             raise
+            wt_doc = wt_doc_ref.get()
+            if wt_doc.exists:
+                fetched_topics = wt_doc.to_dict().get("topics", []) # Expecting a list of strings
+                if isinstance(fetched_topics, list) and fetched_topics:
+                    topics = fetched_topics
+                    logger.info(f"Found weak topics for user {uid}: {topics}")
+                else:
+                     logger.info(f"Weak topics document found for user {uid} but contains no valid 'topics' list.")
+            else:
+                logger.info(f"No weak topics document found for user {uid} at {wt_doc_ref.path}.")
         except Exception as e:
-            logger.error(f"Error calling QuizFlow: {e}")
-            raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INTERNAL, message="Failed to generate quiz questions.")
+            logger.warning(f"Could not fetch weak topics for user {uid}: {e}")
 
-        # 5. Parse & persist quiz
-        logger.info("Persisting generated quiz.")
-        quiz_collection = db.collection("users").document(uid).collection("quizzes")
-        new_quiz_ref = quiz_collection.document()
-        quiz_payload = {
-            "questions": quiz_output["questions"], # Assumes flow returns the correct structure
-            "score": None,
-            "timestamp": now_utc(),
-            "topic": selected_topics # Record the topics used for this quiz
+        # 3. Default fallback topics
+        if not topics:
+            # TODO: Replace with your actual FAA topic list or relevant domain topics
+            topics = ["Airspace", "Weather", "Aircraft Performance", "Federal Aviation Regulations", "Navigation", "Aeromedical Factors"]
+            logger.info(f"Using default topics for user {uid}: {topics}")
+            # Optionally select a subset if the default list is long and the flow has limits
+            # topics = random.sample(topics, min(len(topics), 5))
+
+        # 4. Build quiz input & call Genkit Quiz flow
+        logger.info(f"Calling Genkit Quiz flow for user {uid} with topics: {topics}")
+        quiz_input = {
+            "userId": uid, # Include user ID if flow might use it
+            "numQuestions": num_questions,
+            "topics": topics # Pass the determined list of topics
         }
-        new_quiz_ref.set(quiz_payload)
-        quiz_id = new_quiz_ref.id
-        logger.info(f"Quiz persisted with ID: {quiz_id}")
+        try:
+            # Name "QuizFlow" must match the flow definition name/file
+            quiz_output = load_and_run_flow("QuizFlow", quiz_input)
+            logger.info("Quiz flow returned successfully.")
 
-        # 6. Return
+            # Validate output structure (must contain a list of questions)
+            if not isinstance(quiz_output, dict) or "questions" not in quiz_output or not isinstance(quiz_output["questions"], list):
+                 logger.error(f"QuizFlow output is missing or invalid 'questions' list. Output: {quiz_output}")
+                 raise HttpsError(code=FunctionsErrorCode.INTERNAL, message="Quiz generation failed: invalid format.")
+            if len(quiz_output["questions"]) != num_questions:
+                 logger.warning(f"QuizFlow returned {len(quiz_output['questions'])} questions, but requested {num_questions}.")
+                 # Decide if this is an error or acceptable
+
+            # Optional: Deeper validation of each question's structure
+            for i, q in enumerate(quiz_output["questions"]):
+                 if not isinstance(q, dict) or not all(k in q for k in ["question", "choices", "correctAnswer", "explanation"]):
+                     logger.error(f"Invalid structure for question {i} in QuizFlow output: {q}")
+                     raise HttpsError(code=FunctionsErrorCode.INTERNAL, message="Quiz data format incorrect.")
+                 # Add more checks as needed (e.g., choices is list, correctAnswer is valid index)
+
+        except HttpsError:
+             raise # Re-throw validation errors
+        except Exception as e:
+            logger.error(f"Error calling or processing Quiz flow: {e}")
+            raise HttpsError(code=FunctionsErrorCode.INTERNAL,
+                             message="Failed to generate quiz questions.")
+
+        # 5. Parse & store quiz
+        logger.info("Persisting generated quiz.")
+        quiz_coll_ref = db.collection("users").document(uid).collection("quizzes")
+        quiz_ref = quiz_coll_ref.document() # Create new document ref
+        quiz_payload = {
+            "questions": quiz_output["questions"], # Store the list of question objects
+            "score": None, # Score is null until graded/submitted
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            "topics": topics # Store the topics used for this specific quiz
+        }
+        quiz_ref.set(quiz_payload)
+        quiz_id = quiz_ref.id
+        logger.info(f"Quiz persisted for user {uid} with ID: {quiz_id} under path: {quiz_ref.path}")
+
+        # 6. Return quiz data
         response_payload = {
             "quizId": quiz_id,
-            "questions": quiz_output["questions"]
+            "questions": quiz_output["questions"] # Return the generated questions to the client
         }
-        logger.info("Returning generated quiz.")
+        logger.info(f"Returning generated quiz ID {quiz_id}.")
         return response_payload
 
-    except fn.https_fn.HttpsError as e:
+    except HttpsError as e:
         raise e
     except Exception as e:
         logger.exception(f"An unexpected error occurred in generateQuiz for user {uid}: {e}")
-        raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INTERNAL,
-                                     message="An internal error occurred while generating the quiz.")
+        raise HttpsError(code=FunctionsErrorCode.INTERNAL,
+                         message="An internal error occurred while generating the quiz.")
 
 
 @fn.https_fn.on_call()
 def submitFeedback(request: fn.https_fn.CallableRequest):
-    """Records user feedback on chat messages or quizzes."""
-    logger.info(f"submitFeedback triggered with data: {request.data}")
+    """Records user feedback."""
+    logger.info("submitFeedback triggered.")
 
-    # 1. Auth & input validation
-    if request.auth is None:
+    # 1. Auth & validate input
+    if not request.auth:
         logger.error("Authentication required for submitFeedback.")
-        raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.UNAUTHENTICATED,
-                                     message="The function must be called while authenticated.")
+        raise HttpsError(code=FunctionsErrorCode.UNAUTHENTICATED,
+                         message="Authentication required")
     uid = request.auth.uid
-    feedback_type = request.data.get("type")
-    related_id = request.data.get("relatedId")
-    rating = request.data.get("rating")
-    comment = request.data.get("comment", "") # Optional comment
+    data = request.data or {}
+    typ = data.get("type")        # e.g., "chat", "quiz", "general"
+    rid = data.get("relatedId")   # e.g., messageId, quizId
+    rating = data.get("rating")     # e.g., -1, 0, 1
+    comment = data.get("comment", "") # Optional text comment (ensure default is string)
 
-    # Validate inputs
+    # Validation
     valid_types = ["chat", "quiz", "general"]
-    if feedback_type not in valid_types:
-        logger.error(f"Invalid feedback type: {feedback_type}")
-        raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-                                     message=f"'type' must be one of {valid_types}." )
-    if not related_id or not isinstance(related_id, str):
-         # Allow general feedback without relatedId? Maybe type "general" doesn't need it.
-         if feedback_type != "general":
-             logger.error(f"Missing or invalid relatedId for type '{feedback_type}': {related_id}")
-             raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-                                          message="'relatedId' (string) is required for type 'chat' or 'quiz'." )
-    # Allow rating to be float or int, check range
-    if not isinstance(rating, (int, float)) or rating not in [-1, 0, 1]:
-         logger.error(f"Invalid rating: {rating}")
-         raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-                                      message="'rating' must be -1, 0, or 1." )
+    if typ not in valid_types:
+         raise HttpsError(code=FunctionsErrorCode.INVALID_ARGUMENT,
+                          message=f"Invalid feedback type '{typ}'. Must be one of: {valid_types}.")
+    # relatedId is required for 'chat' and 'quiz' types
+    if typ != "general" and (not rid or not isinstance(rid, str)):
+         raise HttpsError(code=FunctionsErrorCode.INVALID_ARGUMENT,
+                          message=f"Missing or invalid 'relatedId' (string) for feedback type '{typ}'.")
+    # Validate rating (adjust allowed values as needed, e.g., -1, 0, 1)
+    valid_ratings = [-1, 0, 1]
+    if rating not in valid_ratings: # Check exact values
+         raise HttpsError(code=FunctionsErrorCode.INVALID_ARGUMENT,
+                          message=f"Invalid 'rating'. Must be one of: {valid_ratings}.")
     if not isinstance(comment, str):
-         logger.error(f"Invalid comment type: {type(comment)}")
-         raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-                                      message="'comment' must be a string." )
+        raise HttpsError(code=FunctionsErrorCode.INVALID_ARGUMENT,
+                         message="Invalid 'comment'. Must be a string.")
 
     try:
-        # 2. Write to central feedback collection
-        logger.info(f"Writing feedback of type '{feedback_type}' to central collection.")
-        feedback_collection = db.collection("feedback")
-        feedback_doc_ref = feedback_collection.document() # Auto-generate ID
-        feedback_payload = {
+        # 2. Write master feedback record
+        logger.info(f"Writing feedback record (type: {typ}, relatedId: {rid})")
+        fb_ref = db.collection("feedback").document() # Auto-generate ID for the feedback entry
+        fb_payload = {
             "userId": uid,
-            "type": feedback_type,
-            "relatedId": related_id if feedback_type != "general" else None,
+            "type": typ,
+            "relatedId": rid if typ != "general" else None, # Store null if general feedback
             "rating": rating,
             "comment": comment,
-            "timestamp": now_utc()
+            "timestamp": firestore.SERVER_TIMESTAMP
         }
-        feedback_doc_ref.set(feedback_payload)
-        logger.info(f"Feedback stored in /feedback/{feedback_doc_ref.id}")
+        fb_ref.set(fb_payload)
+        logger.info(f"Feedback stored in /feedback/{fb_ref.id}")
 
-        # 3. If chat feedback, update the specific message
-        if feedback_type == "chat":
-            chat_id = request.data.get("chatId") # Need chatId to locate the message
-            message_id = related_id # In chat context, relatedId is the messageId
-            
+        # 3. If chat feedback, update the specific message's feedbackRating
+        if typ == "chat":
+            # Client MUST provide chatId in the request data for chat feedback
+            chat_id = data.get("chatId")
+            message_id = rid # For chat type, relatedId is the messageId
+
             if not chat_id or not isinstance(chat_id, str):
-                 logger.error("Missing chatId for chat feedback update.")
-                 # Log error but don't necessarily fail the whole feedback submission
-                 # Or raise HttpsError if this update is critical
-                 # raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
-                 #                              message="'chatId' is required when submitting chat feedback." )
+                # Log the error, but don't fail the whole submission since the central record is saved.
+                logger.error(f"Missing or invalid 'chatId' in request data for chat feedback (messageId: {message_id}). Cannot update message document.")
             else:
                 try:
-                    message_ref = db.collection("users").document(uid).collection("chats")\
-                                    .document(chat_id).collection("messages").document(message_id)
-                    
-                    # Check if message exists before updating (optional but safer)
-                    message_doc = message_ref.get()
-                    if message_doc.exists:
-                        message_ref.update({"feedbackRating": rating})
-                        logger.info(f"Updated feedbackRating on chat message: /users/{uid}/chats/{chat_id}/messages/{message_id}")
-                    else:
-                         logger.warning(f"Chat message not found, could not update feedbackRating: /users/{uid}/chats/{chat_id}/messages/{message_id}")
+                    # Path to the specific message document
+                    msg_ref = db.collection("users").document(uid) \
+                              .collection("chats").document(chat_id) \
+                              .collection("messages").document(message_id)
+
+                    # Update the 'feedbackRating' field on the message document
+                    # Use update() which fails if the document doesn't exist (safer than set with merge)
+                    msg_ref.update({"feedbackRating": rating})
+                    logger.info(f"Updated feedbackRating ({rating}) on message: {msg_ref.path}")
+                except firebase_admin.exceptions.NotFound:
+                     logger.error(f"Chat message not found, could not update feedbackRating: {msg_ref.path}")
                 except Exception as e:
-                    # Log error but potentially allow feedback to be stored centrally anyway
-                    logger.error(f"Failed to update feedbackRating on chat message {message_id} in chat {chat_id}: {e}")
-        
-        # If quiz feedback, could potentially update the quiz doc, e.g., with average rating
-        # elif feedback_type == "quiz":
-            # quiz_id = related_id
-            # # Update logic for quiz doc if needed
-            # pass
+                    # Log other errors but allow central feedback record to persist.
+                    logger.error(f"Failed to update feedbackRating on message {msg_ref.path}: {e}")
+
+        # Potential extension: Update quiz doc if typ == "quiz"
+        # elif typ == "quiz":
+        #     quiz_id = rid
+        #     # Quiz feedback logic here (e.g., flag quiz for review)
+        #     pass
 
         # 4. Return success
         logger.info("Feedback submission successful.")
-        return { "success": True }
+        return {"success": True}
 
-    except fn.https_fn.HttpsError as e:
-        raise e
+    except HttpsError as e:
+        raise e # Re-throw known validation/auth errors
     except Exception as e:
         logger.exception(f"An unexpected error occurred in submitFeedback for user {uid}: {e}")
-        raise fn.https_fn.HttpsError(code=fn.https_fn.FunctionsErrorCode.INTERNAL,
-                                     message="An internal error occurred while submitting feedback.")
+        raise HttpsError(code=FunctionsErrorCode.INTERNAL,
+                         message="An internal error occurred while submitting feedback.")
 
 
-# Schedule: Run once daily (adjust cron string as needed)
-# e.g., "every day 03:00" or "0 3 * * *"
-@fn.pubsub.schedule(schedule="every 24 hours", timeout_sec=540, memory=fn.options.MemoryOption.MB_256)
+# Scheduled function (using Pub/Sub schedule based on initial code)
+# Adjust schedule, timezone, memory, timeout as needed.
+# Example: Run daily at 3 AM UTC.
+@fn.pubsub.schedule(schedule="every day 03:00", timezone="UTC", timeout_sec=540, memory=fn.options.MemoryOption.MB_256)
 def processFeedbackLoop(event: fn.pubsub.CloudEvent[fn.pubsub.PubsubMessage]):
     """Periodically analyzes recent feedback and generates reports or alerts."""
-    logger.info(f"processFeedbackLoop triggered. Event ID: {event.id}")
-    
+    # Using fn.pubsub.schedule based on original code, could also use fn.scheduler.on_schedule
+    logger.info(f"processFeedbackLoop triggered by Pub/Sub schedule. Event ID: {event.id}")
+
     try:
-        # 1. Query recent feedback
-        cutoff_time = now_utc() - timedelta(hours=24)
-        logger.info(f"Querying feedback submitted after: {cutoff_time.isoformat()}")
-        
-        feedback_collection = db.collection("feedback")
-        query = feedback_collection.where(filter=firestore.FieldFilter("timestamp", ">", cutoff_time))
-        recent_feedback_docs = list(query.stream()) # Execute query and get all docs
-        
-        logger.info(f"Found {len(recent_feedback_docs)} feedback entries in the last 24 hours.")
-        if not recent_feedback_docs:
-            logger.info("No recent feedback to process.")
-            return # Exit early if nothing to do
+        # 1. Query last-24h feedback
+        cutoff = now_utc() - timedelta(hours=24)
+        logger.info(f"Querying feedback submitted after: {cutoff.isoformat()}")
 
-        # 2. Aggregate & detect pain points
-        # Example: Find chat messages with multiple downvotes
-        downvoted_chat_messages = {}
-        general_issues = []
-        quiz_issues = []
+        feedback_coll = db.collection("feedback")
+        # Use FieldFilter for structured query
+        query = feedback_coll.where(filter=FieldFilter("timestamp", ">", cutoff))
+        recent_feedback_stream = query.stream() # Get an iterator
 
-        for doc in recent_feedback_docs:
-            data = doc.to_dict()
+        # 2. Aggregate feedback (using Counter for downvotes per relatedId)
+        logger.info("Aggregating recent feedback.")
+        downvotes = Counter() # Counts occurrences of relatedId for negative ratings
+        negative_feedback_list = [] # Keep track of all negative feedback details if needed
+
+        item_count = 0
+        for fb_doc in recent_feedback_stream:
+            item_count += 1
+            data = fb_doc.to_dict()
             rating = data.get("rating")
-            feedback_type = data.get("type")
-            related_id = data.get("relatedId")
+            related_id = data.get("relatedId") # Can be None for general feedback
 
-            if rating == -1: # Focus on negative feedback
-                if feedback_type == "chat" and related_id:
-                    if related_id not in downvoted_chat_messages:
-                        downvoted_chat_messages[related_id] = []
-                    downvoted_chat_messages[related_id].append(data) # Store full feedback data
-                elif feedback_type == "quiz" and related_id:
-                    quiz_issues.append(data)
-                elif feedback_type == "general":
-                    general_issues.append(data)
-        
-        # Filter for messages with multiple downvotes
-        problematic_message_ids = {msg_id: feedbacks 
-                                   for msg_id, feedbacks in downvoted_chat_messages.items() 
-                                   if len(feedbacks) > 1} # Threshold: > 1 downvote
-        
-        logger.info(f"Found {len(problematic_message_ids)} chat messages with multiple downvotes.")
-        logger.info(f"Found {len(quiz_issues)} downvoted quizzes.")
-        logger.info(f"Found {len(general_issues)} general negative feedback entries.")
+            # Consider ratings < 0 as downvotes (adjust if using different scale)
+            if rating is not None and rating < 0:
+                 negative_feedback_list.append(data) # Store details
+                 if related_id: # Only count if relatedId exists
+                    downvotes[related_id] += 1
 
-        # 3. Take action - Generate a report
-        report_content = {
-            "reportDate": now_utc().strftime("%Y-%m-%d"),
-            "totalFeedbackEntries": len(recent_feedback_docs),
-            "downvotedChatMessagesThreshold": 2,
-            "problematicChatMessages": problematic_message_ids, # Contains lists of feedback dicts per message ID
-            "downvotedQuizzes": quiz_issues,
-            "generalNegativeFeedback": general_issues,
-            "analysisTimestamp": now_utc()
+        logger.info(f"Processed {item_count} feedback entries from the last 24 hours.")
+        logger.info(f"Found {len(negative_feedback_list)} negative feedback entries.")
+
+        # Identify items (e.g., message IDs) with multiple downvotes
+        downvote_threshold = 5 # Threshold from instructions
+        frequent_downvoted_ids = [rid for rid, count in downvotes.items() if count >= downvote_threshold]
+
+        logger.info(f"Found {len(frequent_downvoted_ids)} related IDs with >= {downvote_threshold} downvotes: {frequent_downvoted_ids}")
+
+        # 3. Write a report to Firestore
+        report_date_str = now_utc().strftime("%Y%m%d") # Daily report ID based on date
+        report_id = f"daily_feedback_{report_date_str}" # Use the date in the doc ID
+
+        # Store report in a structured way, e.g., /reports/dailyFeedback/{YYYYMMDD}
+        # Using collection(report_id).document() from instructions seems overly nested.
+        # Storing directly as /reports/dailyFeedback/{report_id} or similar is common.
+        # Let's use /reports/{report_id} for simplicity, assuming other report types might exist.
+        rpt_ref = db.collection("reports").document(report_id)
+
+        report_payload = {
+            # Use 'frequent' as key based on instructions for the list of IDs
+            "problematicMessages": frequent_downvoted_ids, # List of IDs (e.g., message IDs)
+            "timestamp": firestore.SERVER_TIMESTAMP,
+            # Add more context to the report
+            "reportGeneratedAt": now_utc(), # Python datetime for easier querying later if needed
+            "analysisPeriodStart": cutoff,
+            "totalRecentFeedbackEntries": item_count,
+            "totalNegativeFeedbackEntries": len(negative_feedback_list),
+            "downvoteThreshold": downvote_threshold,
+            # Optionally include samples of negative comments (beware of doc size limits)
+            # "negativeFeedbackSamples": negative_feedback_list[:20]
         }
+        rpt_ref.set(report_payload)
+        logger.info(f"Daily feedback report generated: {rpt_ref.path}")
 
-        report_date_str = now_utc().strftime("%Y%m%d")
-        report_ref = db.collection("reports").document(f"dailyFeedback_{report_date_str}")
-        report_ref.set(report_content)
-        logger.info(f"Daily feedback report generated: /reports/dailyFeedback_{report_date_str}")
+        # 4. Optional alerts (e.g., Slack/Email)
+        if frequent_downvoted_ids:
+             alert_message = f"Feedback Alert: {len(frequent_downvoted_ids)} items found with >= {downvote_threshold} downvotes. Check report: {report_id}"
+             logger.warning(alert_message) # Log as warning
+             # --- TODO: Implement your actual alerting mechanism here ---
+             # Example (requires `requests` library and webhook URL):
+             # try:
+             #     import requests, os
+             #     webhook_url = os.environ.get("SLACK_ALERT_WEBHOOK")
+             #     if webhook_url:
+             #         requests.post(webhook_url, json={"text": alert_message})
+             #         logger.info("Sent alert notification.")
+             # except Exception as alert_e:
+             #     logger.error(f"Failed to send alert notification: {alert_e}")
+             # ---------------------------------------------------------
 
-        # Optional: Update Genkit config (e.g., blacklist problematic chunks based on sources in feedback)
-        # This would require parsing sources from the feedback data and mapping to Genkit config updates.
+        # 5. Optional cleanup (e.g., delete feedback older than 90 days)
+        # Perform cleanup carefully, potentially in batches or a separate function.
         # Example placeholder:
-        # for msg_id, feedbacks in problematic_message_ids.items():
-        #     for feedback in feedbacks:
-        #         # Assuming original message data might be needed or stored with feedback
-        #         # sources = find_sources_for_message(feedback["userId"], feedback["chatId"], msg_id) 
-        #         # if sources:
-        #         #     update_genkit_blacklist(sources) ...
-        #     pass
-
-        # Optional: Send notification (Email/Slack)
-        # This requires setting up integrations (e.g., SendGrid, Slack webhook)
-        # if problematic_message_ids or quiz_issues or general_issues:
-        #     send_notification(f"Daily Feedback Alert: {len(problematic_message_ids)} problem messages found.")
-        #     logger.info("Notification sent.")
-
-        # 4. Clean up (Optional)
-        # Example: Delete feedback older than 30 days
-        # cutoff_delete = now_utc() - timedelta(days=30)
-        # query_old = feedback_collection.where(filter=firestore.FieldFilter("timestamp", "<", cutoff_delete)).limit(500) # Process in batches
-        # deleted_count = 0
-        # for doc_to_delete in query_old.stream():
-        #     doc_to_delete.reference.delete()
-        #     deleted_count += 1
-        # logger.info(f"Deleted {deleted_count} feedback entries older than 30 days.")
+        # try:
+        #     cleanup_cutoff = now_utc() - timedelta(days=90)
+        #     old_query = feedback_coll.where(filter=FieldFilter("timestamp", "<", cleanup_cutoff)).limit(500) # Process in batches
+        #     # ... (add batch delete logic here) ...
+        #     logger.info("Performed old feedback cleanup.")
+        # except Exception as cleanup_e:
+        #     logger.error(f"Error during feedback cleanup: {cleanup_e}")
+        # -----------------------------------------
+        pass # End of optional cleanup placeholder
 
         logger.info("processFeedbackLoop completed successfully.")
 
     except Exception as e:
-        logger.exception(f"An error occurred during processFeedbackLoop: {e}")
-        # Don't re-raise for scheduled functions, just log the error.
-        # Consider sending an alert about the failure itself.
+        logger.exception(f"An error occurred during processFeedbackLoop execution: {e}")
+        # Do not re-raise for scheduled functions, just log the error.
+        # Consider sending an alert about the failure of this function itself.

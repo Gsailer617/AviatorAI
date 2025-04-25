@@ -1,0 +1,35 @@
+{
+  "name": "QuizFlow",
+  "steps": [
+    { 
+      "id":"selectTopics",
+      "type":"logic",
+      "description": "Chooses topics based on user's weak areas or defaults.",
+      "params":{
+        "script": "if (input.topics && input.topics.length > 0) { return input.topics; } else { return ['airspace', 'weather', 'performance', 'regulations', 'navigation']; }" 
+      } 
+    },
+    { 
+      "id":"generateQuestions",
+      "type":"llm", 
+      "description": "Generates quiz questions using an LLM.",
+      "params":{
+        "model":"gemini-2.5-flash",
+        "promptTemplate": "Generate {{input.numQuestions}} multiple-choice questions suitable for a private pilot student focusing on these topics: {{selectTopics}}. For each question, provide: the question text, four answer choices, the index (0-3) of the correct answer, and a brief explanation. Format the output as a JSON list of objects, each with keys: 'question', 'choices', 'correctAnswer', 'explanation'.",
+        "input": {
+           "numQuestions": "{{input.numQuestions}}",
+           "topics": "{{selectTopics}}" 
+        },
+        "outputFormat": "json" 
+      } 
+    },
+     {
+      "id": "formatOutput",
+      "type": "logic",
+      "description": "Ensures the output format matches the required structure.",
+      "params": {
+        "script": "return { questions: generateQuestions.output };" // Assuming the LLM output is directly usable
+      }
+    }
+  ]
+}
