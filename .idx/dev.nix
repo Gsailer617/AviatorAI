@@ -6,11 +6,11 @@
   # Use https://search.nixos.org/packages to find packages
   packages = [
     pkgs.nodejs_20
+    pkgs.openjdk17-bootstrap
     pkgs.util-linux
     pkgs.flutter  # Added Flutter
     pkgs.python3  # Added Python 3
     # pkgs.go
-    pkgs.openjdk17-bootstrap
   ];
   # Sets environment variables in the workspace
   env = {

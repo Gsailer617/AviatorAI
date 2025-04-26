@@ -7,17 +7,19 @@ import 'package:flutter_riverpod/flutter_riverpod.dart'; // Added for ProviderSc
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp(); // TODO: Add FirebaseOptions if needed for web/desktop
-  runApp(ProviderScope(child: MyApp())); // Ensure MyApp is defined and imported
+  runApp(const ProviderScope(child: MyApp())); // Ensure MyApp is defined and imported
 }
 
 // Placeholder MyApp widget
 class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       home: Scaffold(
-        appBar: AppBar(title: Text('AviatorAI App')),
-        body: Center(child: Text('Hello Firebase!')),
+        appBar: AppBar(title: const Text('AviatorAI App')),
+        body: const Center(child: Text('Hello Firebase!')),
       ),
     );
   }
